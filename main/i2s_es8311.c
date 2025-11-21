@@ -17,7 +17,9 @@
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 #include "i2s_es8311.h"
+#include "webServer.h"
 
+#define chunk_size      120
 
 uint8_t audio_index = 0;
 uint8_t aquisition_length_seconds = 10; // seconds
@@ -32,6 +34,7 @@ uint16_t *file_from_mic = NULL;
 uint32_t readed_samples = 0;
 
 bool record = false;
+bool play = false;
 
 esp_err_t reserve_memory_for_audio_files()
 {
@@ -90,6 +93,16 @@ esp_err_t reserve_memory_for_audio_files()
     print_memory_status();  // tu función de debug
     ESP_LOGI(TAG, "malloc after print: %p", file_from_mic);
     ESP_LOGI(TAG, "file_from_mic addr: %p", file_from_mic);
+    return ESP_OK;
+}
+
+esp_codec_dev_handle_t codec_handle;
+
+esp_err_t es8311_set_volume(int volume){
+    if (esp_codec_dev_set_out_vol(codec_handle, volume) != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "set output volume failed");
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -152,7 +165,7 @@ static esp_err_t es8311_codec_init(void)
         .codec_if = es8311_if,
         .data_if = data_if,
     };
-    esp_codec_dev_handle_t codec_handle = esp_codec_dev_new(&dev_cfg);
+    codec_handle = esp_codec_dev_new(&dev_cfg);
     assert(codec_handle);
 
     /* Specify the sample configurations and open the device */
@@ -168,10 +181,7 @@ static esp_err_t es8311_codec_init(void)
     }
 
     /* Set the initial volume and gain */
-    if (esp_codec_dev_set_out_vol(codec_handle, VOLUME) != ESP_CODEC_DEV_OK) {
-        ESP_LOGE(TAG, "set output volume failed");
-        return ESP_FAIL;
-    }
+    es8311_set_volume(VOLUME);
 
     if (esp_codec_dev_set_in_gain(codec_handle, MIC_GAIN) != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "set input gain failed");
@@ -304,16 +314,56 @@ static esp_err_t i2s_driver_init(uint32_t sample_rate)
 //     vTaskDelete(NULL);
 // }
 
+static esp_err_t i2s_play_data(){
+    ESP_LOGI(TAG, "i2s_play_data");
+    if (!file_from_web) {
+        ESP_LOGE(TAG, "file_from_web buffer is NULL");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (received_samples <= 0){
+        ESP_LOGE(TAG, "No samples to play");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (received_samples > (I2S_SAMPLE_RATE * MAX_LENGTH_SECONDS)) {
+        ESP_LOGE(TAG, "Sample count exceeds maximum allowed");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t played_samples = 0;
+    size_t to_write;
+    size_t bytes_written;
+    while (played_samples < received_samples) {
+        to_write = (received_samples - played_samples < chunk_size) ? received_samples - played_samples : chunk_size;
+        i2s_channel_write(tx_handle, 
+            &file_from_web[played_samples], 
+            to_write * sizeof(uint16_t), 
+            &bytes_written, 
+            portMAX_DELAY
+        );
+
+        if (bytes_written != to_write * sizeof(uint16_t)) {
+            ESP_LOGE(TAG, "Error writing to I2S: %d bytes written", bytes_written);
+            return ESP_FAIL;
+        } else {
+            played_samples += to_write;
+        }
+        
+    }
+
+    ESP_LOGI(TAG, "%d samples played", (int)played_samples);
+    return ESP_OK;
+}
+
 static esp_err_t i2s_save_data(uint16_t length) {
     ESP_LOGI(TAG, "i2s_save_data");
-    // length = 1;
     if (length > MAX_LENGTH_SECONDS) {
         ESP_LOGE(TAG, "Length exceeds maximum allowed duration");
         return ESP_ERR_INVALID_ARG;
     }
 
     readed_samples = 0;
-    size_t chunk_size = 120;
     uint32_t nsamples = length * I2S_SAMPLE_RATE;
     size_t bytes_readed;
 
@@ -403,7 +453,7 @@ static esp_err_t i2s_save_data(uint16_t length) {
 
 static void task(void *args){
     while(1){
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(100));
         // ESP_LOGI(TAG, "recording loop: %d", record);
         if (record == true){
             record = false;
@@ -431,6 +481,30 @@ static void task(void *args){
                 ESP_LOGI(TAG, "Recording finished");
             }
             recording = false;
+
+        } else if (play == true) {
+            play = false;
+            playing = true;
+            #ifdef AUDIO_DEBUG
+                // Signal to speacker
+                // Antenna as input
+                gpio_set_level(SW1, 0);
+                gpio_set_level(SW2, 0);
+            #else
+                // Signal to antenna
+                // Antenna as output
+                gpio_set_level(SW1, 1);
+                gpio_set_level(SW2, 1);
+            #endif
+            gpio_set_level(AMP_CTRL, 1); // Amplifier on
+            vTaskDelay(pdMS_TO_TICKS(10));
+
+            if (i2s_play_data() != ESP_OK) {
+                ESP_LOGE(TAG, "Error playing data from I2S");
+            } else {
+                ESP_LOGI(TAG, "Playing finished");
+            }
+            playing = false;
         }
     }
 }

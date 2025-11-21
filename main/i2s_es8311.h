@@ -23,6 +23,7 @@ extern uint16_t *file_from_web;
 extern uint16_t *file_from_mic;
 
 extern bool record;
+extern bool play;
 
 extern uint8_t aquisition_length_seconds;
 extern uint32_t readed_samples;
@@ -38,6 +39,8 @@ extern audio_buffer_t audio_buffers[NUM_BUFFERS];
 extern uint8_t audio_index;
 
 esp_err_t init_i2s_es8311(uint32_t sample_rate);
+
+esp_err_t es8311_set_volume(int volume);
 
 esp_err_t reserve_memory_for_audio_files();
 

@@ -18,6 +18,8 @@
 
 static const char *TAG = "webServer";
 
+size_t received_samples = 0;
+
 static bool uri_casei(const char *uri, const char *match_uri, size_t match_upto) {
     // compara sin mayúsc/minúsc — soporta match_upto (prefijos)
     size_t n = match_upto ? match_upto : strlen(match_uri);
@@ -31,7 +33,7 @@ esp_err_t record_uri_handler(httpd_req_t *req) {
     int ret = httpd_req_get_url_query_str(req, query, sizeof(query));
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "No valid querry provided : %d", ret);
-        httpd_resp_send(req, "No valid length", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, "No valid querry provided", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     query[63] = '\0';
@@ -70,6 +72,47 @@ esp_err_t record_uri_handler(httpd_req_t *req) {
     record = true;
     return ESP_OK;
 }
+
+esp_err_t play_uri_handler(httpd_req_t *req) {
+    char query[64] = {0};
+    int ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "No valid querry provided : %d", ret);
+        httpd_resp_send(req, "No valid querry provided", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    query[63] = '\0';
+
+    char length_str[5] = {0};
+    if (httpd_query_key_value(query, "play", length_str, sizeof(length_str)) != ESP_OK) {
+        ESP_LOGW(TAG, "Play not found in query %d", ret);
+        httpd_resp_send(req, "Play not found", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+
+    if (httpd_query_key_value(query, "vol", length_str, sizeof(length_str)) == ESP_OK) {
+        length_str[4] = '\0';
+        int volume = atoi(length_str);
+        if (volume <= 100 && volume > 0){
+            ESP_LOGI(TAG, "Setting volume to %d", volume);
+            if (es8311_set_volume(volume) != ESP_OK) {
+                ESP_LOGE(TAG, "Error setting volume to %d", volume);
+            } else {
+                ESP_LOGI(TAG, "Volume set to %d", volume);
+            }
+        }
+    }
+
+    char ans[32];
+    snprintf(ans, sizeof(ans), "Sent to play");
+    httpd_resp_send(req, ans, HTTPD_RESP_USE_STRLEN);
+
+    ESP_LOGI(TAG, "Trigger play via HTTP.");
+    play = true;
+    return ESP_OK;
+}
+
 
 esp_err_t getFile(httpd_req_t *req) {
     sending = true;
@@ -172,6 +215,7 @@ esp_err_t getFile(httpd_req_t *req) {
     return err == ESP_OK ? ESP_OK : ESP_FAIL;
 }
 
+// This function handles the /get_samples URI to send recorded samples from ESP32-S3 to the PC.
 esp_err_t get_samples(httpd_req_t *req) {
     sending = true;
 
@@ -229,6 +273,101 @@ esp_err_t get_samples(httpd_req_t *req) {
 
     sending = false;
     return err == ESP_OK ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t post_samples(httpd_req_t *req) {
+    receiving = true;
+
+    // Verify Content-Length is present and valid
+    if (req->content_len == 0 || req->content_len > (10 * I2S_SAMPLE_RATE * sizeof(uint16_t))) {
+        ESP_LOGE(TAG, "Invalid content length: %d", (int)req->content_len);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+        receiving = false;
+        return ESP_OK;
+    }
+
+    // Get filename from query
+    char query[64] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing query");
+        receiving = false;
+        return ESP_OK;
+    }
+
+    char filename[33] = {0};
+    if (httpd_query_key_value(query, "filename", filename, sizeof(filename)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'filename'");
+        receiving = false;
+        return ESP_OK;
+    }
+
+    // Verify filename is "samples.bsc"
+    if (strcmp(filename, "samples.bsc") != 0) {
+        ESP_LOGE(TAG, "Invalid filename: %s", filename);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Filename must be 'samples.bsc'");
+        receiving = false;
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Receiving samples: %s (%d bytes)", filename, (int)req->content_len);
+
+    // Verify file_from_web buffer is available
+    if (!file_from_web) {
+        ESP_LOGE(TAG, "file_from_web buffer not initialized");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Buffer not available");
+        receiving = false;
+        return ESP_OK;
+    }
+
+    // Allocate temporary buffer for receiving data
+    uint8_t *buf = (uint8_t *)malloc(MAX_CHUNK_SIZE);
+    if (!buf) {
+        ESP_LOGE(TAG, "No memory for receive buffer");
+        httpd_resp_send_500(req);
+        receiving = false;
+        return ESP_FAIL;
+    }
+
+    size_t received = 0;
+    size_t remaining = req->content_len;
+    esp_err_t err = ESP_OK;
+
+    while (remaining > 0) {
+        size_t to_read = remaining > MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : remaining;
+        int r = httpd_req_recv(req, (char *)buf, to_read);
+        
+        if (r <= 0) {
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            ESP_LOGE(TAG, "Error receiving data");
+            free(buf);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive error");
+            sending = false;
+            return ESP_OK;
+        }
+
+        // Copy to file_from_web buffer
+        memcpy((uint8_t *)file_from_web + received, buf, r);
+        received += r;
+        remaining -= r;
+        
+        ESP_LOGI(TAG, "Received chunk: %d bytes, total: %d bytes", r, (int)received);
+    }
+
+    free(buf);
+
+    // Update sample count
+    received_samples = received / sizeof(uint16_t);
+    ESP_LOGI(TAG, "Received %d samples (%d bytes)", (int)received_samples, (int)received);
+
+    // Send success response
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_sendstr(req, "OK");
+
+    receiving = false;
+    return ESP_OK;
 }
 
 #define MAX_FILENAME_LEN   32
@@ -372,7 +511,6 @@ void ws_init() {
         };
         httpd_register_uri_handler(server, &co_uri);
 
-
         httpd_uri_t post_uri = {
             .uri      = "/postFile",
             .method   = HTTP_POST,
@@ -388,6 +526,22 @@ void ws_init() {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &record_uri);
+
+        httpd_uri_t getfile_uri = {
+            .uri      = "/post_samples",
+            .method   = HTTP_POST,
+            .handler  = post_samples,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &getfile_uri);
+
+        httpd_uri_t play_uri = {
+            .uri      = "/play",
+            .method   = HTTP_GET,
+            .handler  = play_uri_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &play_uri);
 
         ESP_LOGI(TAG, "HTTP server started");
     } else {
