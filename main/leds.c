@@ -38,7 +38,7 @@ led_strip_handle_t configure_led(void)
     return led_strip;
 }
 
-static void leds_fill_alternating_task(void *arg)
+void leds_fill_alternating_task(void *arg)
 {
     led_strip_handle_t led_strip = configure_led();
     ESP_ERROR_CHECK(led_strip_clear(led_strip));
@@ -46,36 +46,51 @@ static void leds_fill_alternating_task(void *arg)
 
     size_t idx = 0;
     bool blue_phase = true;  // true = blue, false = yellow
+    uint8_t brightness_level = 0;
+    bool brightness_increasing = true;
 
     while (1) {
         if (sending == true) {
+            // SENDING purple
             for (size_t i = 0; i < LED_STRIP_LED_COUNT; i++) {
-                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, BRIGHTNESS, 0, 0)); // Red color for sending
+                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, brightness_level, 0, brightness_level));
             }
             ESP_ERROR_CHECK(led_strip_refresh(led_strip));
         } else if (receiving == true) {
+            // RECEIVING red
             for (size_t i = 0; i < LED_STRIP_LED_COUNT; i++) {
-                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, 0, BRIGHTNESS, 0)); // Green color for receiving
+                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, brightness_level, 0, 0));
             }
             ESP_ERROR_CHECK(led_strip_refresh(led_strip));
         } else if (recording == true) {
+            // RECORDING blue
             for (size_t i = 0; i < LED_STRIP_LED_COUNT; i++) {
-                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, BRIGHTNESS, 0, 0)); // Red color for sending
+                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, 0, 0, brightness_level));
             }
             ESP_ERROR_CHECK(led_strip_refresh(led_strip));
         } else if (playing == true) {
+            // PLAYING green
             for (size_t i = 0; i < LED_STRIP_LED_COUNT; i++) {
-                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, 0, BRIGHTNESS, 0)); // Green color for sending
+                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, 0, brightness_level, 0));
             }
             ESP_ERROR_CHECK(led_strip_refresh(led_strip));
         } else {
-            const uint8_t *c = blue_phase ? COLOR_BLUE : COLOR_YELLOW;
-            ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, idx, c[0], c[1], c[2]));
+            // IDLE Amber
+            for (size_t i = 0; i < LED_STRIP_LED_COUNT; i++) {
+                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, i, brightness_level, brightness_level / 2, 0));
+            }
             ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-            idx++;
-            if (idx >= LED_STRIP_LED_COUNT) {
-                idx = 0;
-                blue_phase = !blue_phase;
+        }
+
+        if (brightness_increasing) {
+            brightness_level += 5;
+            if (brightness_level >= BRIGHTNESS_MAX) {
+                brightness_increasing = false;
+            }
+        } else {
+            brightness_level -= 5;
+            if (brightness_level <= BRIGHTNESS_MIN) {
+                brightness_increasing = true;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(LEDS_UPDATE_INTERVAL));

@@ -12,6 +12,7 @@
 #include "main.h"
 #include "webServer.h"
 #include "i2s_es8311.h"
+#include "leds.h"
 
 static const char *TAG = "main";
 
@@ -132,11 +133,14 @@ void app_main(void)
     ESP_LOGI(TAG, "Configure GPIOs...");
     configure_gpio();
 
-    ESP_LOGI(TAG, "loop...");
-
+    ESP_LOGI(TAG, "Reserve memory for audio files...");
     ESP_ERROR_CHECK(reserve_memory_for_audio_files());
 
+    ESP_LOGI(TAG, "Initialize I2S, ES8311 codec and audio task");
     ESP_ERROR_CHECK(init_i2s_es8311(I2S_SAMPLE_RATE));
+
+    ESP_LOGI(TAG, "Initialize LEDs...");
+    xTaskCreate(leds_fill_alternating_task, "leds_task", 2*2048, NULL, 5, NULL);
 
     while(1) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);

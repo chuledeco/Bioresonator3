@@ -330,7 +330,6 @@ esp_err_t post_samples(httpd_req_t *req) {
 
     size_t received = 0;
     size_t remaining = req->content_len;
-    esp_err_t err = ESP_OK;
 
     while (remaining > 0) {
         size_t to_read = remaining > MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : remaining;
@@ -370,131 +369,6 @@ esp_err_t post_samples(httpd_req_t *req) {
     return ESP_OK;
 }
 
-#define MAX_FILENAME_LEN   32
-#define MAX_PATH_LEN       64
-#define POST_BUF_SIZE      4096   // 1 KB por chunk
-
-static esp_err_t postFile(httpd_req_t *req)
-{
-    sending = true;
-    size_t total=0, used=0;
-    esp_err_t info = esp_spiffs_info(NULL, &total, &used);
-    ESP_LOGI(TAG, "SPIFFS total=%u used=%u free=%u need=%u",
-            (unsigned)total, (unsigned)used,
-            (unsigned)(total - used),
-            (unsigned)req->content_len);
-
-    if (info != ESP_OK || (total - used) < req->content_len + 4096) {
-        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Not enough space");
-        // opcional: sugerir borrar algo o usar otro filename
-        sending = false;
-        return ESP_OK;
-    }
-
-    // Get gilename from query
-    char query[64] = {0};
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing query");
-        sending = false;
-        return ESP_OK;
-    }
-
-    char filename[MAX_FILENAME_LEN + 1] = {0};
-    if (httpd_query_key_value(query, "filename", filename, sizeof(filename)) != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'filename'");
-        sending = false;
-        return ESP_OK;
-    }
-
-    // Verify absence of /\ in filename
-    for (char *p = filename; *p; ++p) {
-        if (*p == '/' || *p == '\\') {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
-            sending = false;
-            return ESP_OK;
-        }
-    }
-
-    // Verify extension .bsc
-    const char *ext = ".bsc";
-    size_t len = strlen(filename), ext_len = strlen(ext);
-    if (len <= ext_len || strcmp(filename + len - ext_len, ext) != 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid extension");
-        sending = false;
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "Posting file: %s", filename);
-    
-    // Open the file and override if exists
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "/spiffs/%s", filename);
-
-    unlink(path);
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Open failed");
-        sending = false;
-        return ESP_OK;
-    }
-    ESP_LOGI(TAG, "File opened");
-
-    // Read in blocks and save
-    uint8_t *buf = (uint8_t *)malloc(POST_BUF_SIZE);
-    if (!buf) {
-        ESP_LOGE(TAG, "No enough memory for buffer");
-        fclose(fp);
-        httpd_resp_send_500(req);
-        sending = false;
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "Reserved memory for buffer");
-    int accumulated = 0;
-    size_t remaining = req->content_len;
-    while (remaining > 0) {
-        size_t to_read = remaining > POST_BUF_SIZE ? POST_BUF_SIZE : remaining;
-        int r = httpd_req_recv(req, (char *)buf, to_read);
-        if (r <= 0) {
-            if (r == HTTPD_SOCK_ERR_TIMEOUT) {
-                // Retry on timeout
-                continue;
-            }
-            // Error en recv
-            free(buf);
-            fclose(fp);
-            ESP_LOGE(TAG, "Error receiving data");
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Recv error");
-            sending = false;
-            return ESP_OK;
-        }
-        // Write to file
-        size_t w = fwrite(buf, 1, r, fp);
-        if (w != (size_t)r) {
-            free(buf);
-            fclose(fp);
-            ESP_LOGE(TAG, "Write error");
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write error");
-            sending = false;
-            return ESP_OK;
-        }
-        accumulated += r;
-        ESP_LOGI(TAG, "Chunk saved size: %d total siz: %d", r, accumulated);
-        remaining -= r;
-    }
-
-    free(buf);
-    fclose(fp);
-
-    // OK response
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_set_hdr(req, "Connection", "close");
-    httpd_resp_sendstr(req, "OK");
-
-    sending = false;
-    return ESP_OK;
-}
-
 void ws_init() {
     
     httpd_handle_t server = NULL;
@@ -510,14 +384,6 @@ void ws_init() {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &co_uri);
-
-        httpd_uri_t post_uri = {
-            .uri      = "/postFile",
-            .method   = HTTP_POST,
-            .handler  = postFile,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &post_uri);
 
         httpd_uri_t record_uri = {
             .uri      = "/record",
